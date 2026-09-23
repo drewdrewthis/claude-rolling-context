@@ -63,6 +63,18 @@ LEGACY_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 # is still far cheaper than a session that never compresses again.
 FALLBACK_MODEL = os.environ.get("ROLLING_CONTEXT_FALLBACK_MODEL") or "claude-sonnet-5"
 
+# Per-call input budget for the summarizer, in characters (issue #14). A single
+# cut bounds only the KEPT tail; the whole prefix was still summarized in ONE
+# request, so once the prefix outgrew the summarizer's input window every
+# attempt 400'd ("prompt is too long: N tokens > 1000000 maximum"), cooled down
+# 300s, and re-sent the same oversized prompt forever — context never shrank.
+# When the prefix exceeds this budget we fold it in bounded windows instead.
+# Default ~2_000_000 chars ≈ ~500k tokens (~4 chars/token) — comfortably under a
+# 1M-token input window even after system prompt + tools overhead and tokenizer
+# variance. Char-based because the whole compressor already measures in chars
+# (_count_chars / _messages_to_text), so the budget is enforced by construction.
+SUMMARIZE_MAX_CHARS = int(os.environ.get("ROLLING_CONTEXT_SUMMARIZE_MAX_CHARS") or 2_000_000)
+
 ssl_ctx = endpoints.outbound_ssl_context()
 
 _parsed_summarizer = urlparse(SUMMARIZER_BASE_URL)
@@ -551,6 +563,88 @@ class RollingCompressor:
     # Flattened mode: standalone request to a custom summarizer
     # ------------------------------------------------------------------
 
+    def _existing_summary_section(self, existing_summary: str) -> str:
+        """The 'integrate the prior rolling summary' block for SUMMARIZE_PROMPT.
+
+        Shared by the ordinary flattened path and the bounded fold (issue #14)
+        so a folded window integrates the previous partial summary exactly the
+        way a follow-up compression integrates an earlier one."""
+        if not existing_summary:
+            return ""
+        return (
+            "EXISTING ROLLING SUMMARY FROM PREVIOUS COMPRESSIONS "
+            "(integrate this timeline with the new conversation below — "
+            "keep all details, extend the timeline):\n"
+            f"{existing_summary}\n\n"
+        )
+
+    def _take_fold_window(self, messages: list, content_budget: int):
+        """Greedily accumulate a leading window whose flattened text fits budget.
+
+        Returns (window, remaining). A single message whose flattened text alone
+        exceeds the budget becomes its own window — _messages_to_text truncates
+        each block, so its text is already bounded."""
+        window = []
+        used = 0
+        for idx, m in enumerate(messages):
+            piece = len(self._messages_to_text([m]))
+            sep = 2 if window else 0  # "\n\n" join between pieces
+            if window and used + sep + piece > content_budget:
+                return window, messages[idx:]
+            window.append(m)
+            used += sep + piece
+        return window, []
+
+    def _summarize_folded(self, to_compress: list, existing_summary: str,
+                          auth_headers: dict, session_model: str) -> str:
+        """Summarize an oversized prefix in bounded windows, folding forward.
+
+        Splits to_compress into sequential windows each sized so the flattened
+        summarize request stays within SUMMARIZE_MAX_CHARS, then folds: window 1
+        -> S1 (no existing summary), window i summarized with S_{i-1} integrated
+        via _existing_summary_section -> S_i. The final S is the rolling
+        summary. Uses the char-bounded flattened summarizer on purpose — native
+        prompt-cache reuse is forfeited only on this rare path, which currently
+        fails outright, so this is strictly better (issue #14)."""
+        # SUMMARIZE_PROMPT has exactly two placeholders, so the formatted length
+        # is template_overhead + len(section) + len(conversation) exactly.
+        template_overhead = len(SUMMARIZE_PROMPT.format(
+            existing_summary_section="", conversation=""))
+        remaining = list(to_compress)
+        summary = existing_summary
+        windows = 0
+        while remaining:
+            existing_section = self._existing_summary_section(summary)
+            content_budget = SUMMARIZE_MAX_CHARS - template_overhead - len(existing_section)
+            window, remaining = self._take_fold_window(remaining, content_budget)
+            conversation_text = self._messages_to_text(window)
+            prompt = SUMMARIZE_PROMPT.format(
+                existing_summary_section=existing_section,
+                conversation=conversation_text,
+            )
+            if len(prompt) > SUMMARIZE_MAX_CHARS:
+                # A lone message plus the running summary and prompt scaffold
+                # still overflow the window. Do NOT loop re-sending — surface a
+                # terminal error naming the size so the session gets rotated.
+                raise RuntimeError(
+                    f"Bounded-fold window still exceeds the summarizer budget "
+                    f"({len(prompt):,} > {SUMMARIZE_MAX_CHARS:,} chars); "
+                    f"the session must be rotated")
+            windows += 1
+            log.info(
+                f"Bounded fold window {windows}: {len(window)} messages, "
+                f"{len(prompt):,} chars (folds prior summary: {bool(summary)})")
+            try:
+                summary = self._summarize_flattened(
+                    prompt, auth_headers, model_override=session_model)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Bounded-fold window {windows} ({len(prompt):,} chars) "
+                    f"rejected by the summarizer ({e}); the session must be "
+                    f"rotated") from e
+        log.info(f"Bounded fold complete: {windows} windows folded")
+        return summary
+
     def _summarize_flattened(self, prompt: str, auth_headers: dict,
                              model_override: str = "") -> str:
         summary_max_tokens = 16000
@@ -655,48 +749,60 @@ class RollingCompressor:
 
         recent_messages = messages[keep_from_idx:]
 
-        use_native = NATIVE_MODE and payload is not None
-        if use_native:
-            try:
-                new_summary = self._summarize_native(
-                    payload, messages, keep_from_idx, auth_headers)
-            except Exception as e:
-                if not NATIVE_FALLBACK:
-                    raise
-                # A third-party endpoint that choked on the cloned request
-                # shape. One flattened retry beats a 300s cooldown and a
-                # session that never compresses at all.
-                log.warning(
-                    f"Native compaction failed against {SUMMARIZER_BASE_URL} "
-                    f"({e}); retrying flattened"
-                )
-                use_native = False
-        if not use_native:
-            existing_summary = self._extract_summary(messages) if has_existing_summary else ""
-            to_compress = messages[start_idx:keep_from_idx]
-            if not to_compress:
-                log.info("Nothing to compress")
-                return None
-            conversation_text = self._messages_to_text(to_compress)
-            existing_section = ""
-            if existing_summary:
-                existing_section = (
-                    "EXISTING ROLLING SUMMARY FROM PREVIOUS COMPRESSIONS "
-                    "(integrate this timeline with the new conversation below — "
-                    "keep all details, extend the timeline):\n"
-                    f"{existing_summary}\n\n"
-                )
-            prompt = SUMMARIZE_PROMPT.format(
-                existing_summary_section=existing_section,
-                conversation=conversation_text,
-            )
+        existing_summary = self._extract_summary(messages) if has_existing_summary else ""
+        to_compress = messages[start_idx:keep_from_idx]
+        if not to_compress:
+            log.info("Nothing to compress")
+            return None
+        prefix_chars = self._count_chars(to_compress)
+
+        if prefix_chars > SUMMARIZE_MAX_CHARS:
+            # Issue #14: the prefix alone overflows the summarizer's input
+            # window. A single call would 400 ("prompt is too long"), cool down
+            # 300s, and re-send the same oversized prompt forever. Fold it in
+            # bounded windows instead — this forfeits native prompt-cache reuse
+            # on this rare path, which currently fails entirely, so it is
+            # strictly better. Pass the session model through the same way the
+            # flattened fallback does.
             log.info(
-                f"Summarizing {keep_from_idx - start_idx} messages "
-                f"({len(conversation_text):,} chars, flattened)..."
+                f"Prefix {prefix_chars:,} chars exceeds the "
+                f"{SUMMARIZE_MAX_CHARS:,}-char summarizer budget; folding in "
+                f"bounded windows"
             )
-            session_model = (payload or {}).get("model", "") if NATIVE_FALLBACK else ""
-            new_summary = self._summarize_flattened(
-                prompt, auth_headers, model_override=session_model)
+            session_model = (payload or {}).get("model", "")
+            new_summary = self._summarize_folded(
+                to_compress, existing_summary, auth_headers, session_model)
+        else:
+            use_native = NATIVE_MODE and payload is not None
+            if use_native:
+                try:
+                    new_summary = self._summarize_native(
+                        payload, messages, keep_from_idx, auth_headers)
+                except Exception as e:
+                    if not NATIVE_FALLBACK:
+                        raise
+                    # A third-party endpoint that choked on the cloned request
+                    # shape. One flattened retry beats a 300s cooldown and a
+                    # session that never compresses at all.
+                    log.warning(
+                        f"Native compaction failed against {SUMMARIZER_BASE_URL} "
+                        f"({e}); retrying flattened"
+                    )
+                    use_native = False
+            if not use_native:
+                conversation_text = self._messages_to_text(to_compress)
+                existing_section = self._existing_summary_section(existing_summary)
+                prompt = SUMMARIZE_PROMPT.format(
+                    existing_summary_section=existing_section,
+                    conversation=conversation_text,
+                )
+                log.info(
+                    f"Summarizing {keep_from_idx - start_idx} messages "
+                    f"({len(conversation_text):,} chars, flattened)..."
+                )
+                session_model = (payload or {}).get("model", "") if NATIVE_FALLBACK else ""
+                new_summary = self._summarize_flattened(
+                    prompt, auth_headers, model_override=session_model)
 
         log.info(f"Summary generated: {len(new_summary):,} chars")
 
