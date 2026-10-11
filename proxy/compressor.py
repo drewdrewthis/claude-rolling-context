@@ -682,6 +682,19 @@ class RollingCompressor:
                 }
             else:
                 headers = _clean_headers(auth_headers)
+                # A flattened request is small by construction (one window of
+                # at most SUMMARIZE_MAX_CHARS), so it never needs the session's
+                # long-context beta. Forwarding it makes Haiku 4.5 refuse the
+                # request on a subscription login: 400 "The long context beta
+                # is not yet available for this subscription".
+                for _k in list(headers):
+                    if _k.lower() == "anthropic-beta":
+                        _kept = [b.strip() for b in headers[_k].split(",")
+                                 if b.strip() and not b.strip().startswith("context-1m")]
+                        if _kept:
+                            headers[_k] = ",".join(_kept)
+                        else:
+                            del headers[_k]
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
 
