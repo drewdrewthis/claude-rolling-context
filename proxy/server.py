@@ -611,7 +611,8 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
         # save after the assignment would race it (issue #65).
         try:
             saved = fold_store.save(entry.get("owner") or "", key_hashes, prefix)
-            log.info(f"[STATE] Saved fold {os.path.basename(saved)}")
+            if saved:
+                log.info(f"[STATE] Saved fold {os.path.basename(saved)}")
         except Exception as e:
             log.warning(f"[STATE] Could not save fold (compression kept in memory): {e}")
         entry["pending"] = prefix

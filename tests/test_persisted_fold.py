@@ -281,6 +281,65 @@ def unit_tests():
     r = st.delete("o", ["a", "b"]) if hasattr(st, "delete") else None
     check("delete of a missing file returns False", r is False, repr(r))
 
+    print(" delete refuses special files")
+    import signal
+
+    def _alarm(signum, frame):
+        raise TimeoutError("blocked")
+
+    old_handler = signal.signal(signal.SIGALRM, _alarm)
+    try:
+        fd_dir = os.path.join(root, "del-fifo")
+        os.makedirs(fd_dir)
+        fifo = os.path.join(fd_dir, _fname("o"))
+        os.mkfifo(fifo)
+        t0 = time.time()
+        signal.alarm(3)
+        try:
+            r = FoldStore(fd_dir).delete("o", ["a"])
+        except TimeoutError:
+            r = "blocked"
+        finally:
+            signal.alarm(0)
+        elapsed = time.time() - t0
+        check("delete on a FIFO returns False", r is False, repr(r))
+        check("delete on a FIFO returns within 2 s", elapsed < 2, f"{elapsed:.1f}s")
+
+        real_dir = os.path.join(root, "del-real")
+        target = FoldStore(real_dir).save("o", ["a", "b"], prefix)
+        link_dir = os.path.join(root, "del-link")
+        os.makedirs(link_dir)
+        os.symlink(target, os.path.join(link_dir, _fname("o")))
+        signal.alarm(3)
+        try:
+            r = FoldStore(link_dir).delete("o", ["a", "b"])
+        except TimeoutError:
+            r = "blocked"
+        finally:
+            signal.alarm(0)
+        check("delete through a symlink returns False", r is False, repr(r))
+        check("delete through a symlink leaves the target", os.path.exists(target))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+    print(" load skips folds owned by another uid")
+    uid_dir = os.path.join(root, "uid")
+    FoldStore(uid_dir).save("o", ["a"], prefix)
+    check("fold loads as the owning uid", len(FoldStore(uid_dir).load()) == 1)
+    had = hasattr(fold_store, "_euid")
+    saved_euid = getattr(fold_store, "_euid", None)
+    fold_store._euid = lambda: os.geteuid() + 1
+    try:
+        got = FoldStore(uid_dir).load()
+    finally:
+        if had:
+            fold_store._euid = saved_euid
+        else:
+            del fold_store._euid
+    check("fold owned by another uid is skipped", got == [], repr(got))
+    check("fold_store exposes _euid", had and saved_euid is not None)
+
     print(" stale tmp files")
     d = os.path.join(root, "tmp")
     os.makedirs(d)

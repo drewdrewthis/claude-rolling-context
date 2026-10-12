@@ -25,6 +25,8 @@ _VERSION = 1
 # Read at call time so tests can monkeypatch.
 MAX_FILE_BYTES = 8 * 1024 * 1024
 TMP_MAX_AGE = 3600
+# Called at read time so tests can monkeypatch; absent on Windows (no uid check).
+_euid = getattr(os, "geteuid", lambda: None)
 _FOLD_RE = re.compile(r"^fold-[0-9a-f]{32}\.json$")
 
 
@@ -143,21 +145,39 @@ class FoldStore:
             return False
         path = os.path.join(self.directory, _fold_name(owner))
         try:
-            with open(path, encoding="utf-8") as f:
-                rec = json.load(f)
+            rec = self._read(path)
             if not (isinstance(rec, dict)
                     and rec.get("original_hashes") == list(original_hashes)):
                 return False
             os.unlink(path)
             return True
-        except (OSError, ValueError):
+        except Exception:
             return False
 
     def _read(self, path: str):
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES:
-            return None
-        with open(path, encoding="utf-8") as f:
+        """Parsed JSON, or None if the file is not ours, regular and small.
+
+        Checks run on the opened fd, so nothing can be swapped in between
+        check and read. O_NONBLOCK keeps a FIFO from hanging the open.
+        """
+        flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(path, flags)
+        try:
+            st = os.fstat(fd)
+            uid = _euid()
+            if (not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES
+                    or (uid is not None and st.st_uid != uid)):
+                os.close(fd)
+                return None
+            f = os.fdopen(fd, encoding="utf-8")
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        with f:
             return json.load(f)
 
     def load(self) -> list:
