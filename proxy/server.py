@@ -349,6 +349,7 @@ def _normalize_content(content):
     return content
 
 
+# Changing this hash (or _normalize_content / _strip_volatile_tags) must bump fold_store.HASH_SCHEME, or saved folds silently stop matching.
 def _hash_message(msg: dict) -> str:
     """Stable hash of a message, ignoring cache_control metadata."""
     role = msg.get("role", "")
@@ -956,6 +957,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     f"merged={merged_chars:,} >= current={msg_chars:,} chars, removing"
                 )
                 store.remove(match)
+                try:
+                    fold_store.delete(match.get("owner"), match["original_hashes"])
+                except Exception as e:
+                    log.warning(f"[STATE] Could not delete pruned fold: {e}")
                 match = None
 
         # Save current state for post-response compression trigger
@@ -1288,7 +1293,11 @@ def main():
              f"{' (third-party — flattened fallback armed)' if NATIVE_FALLBACK else ''}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
 
-    loaded = fold_store.load()
+    try:
+        loaded = fold_store.load()
+    except Exception as e:
+        log.warning(f"[STATE] Could not load persisted folds: {e}")
+        loaded = []
     for rec in loaded:
         e = store.add()
         e["owner"] = rec["owner"]

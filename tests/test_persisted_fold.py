@@ -19,6 +19,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -47,7 +48,10 @@ def check(label, cond, extra=""):
 # ---------------------------------------------------------------- part A ----
 
 def _fname(owner):
-    return hashlib.sha256(owner.encode("utf-8")).hexdigest()[:32] + ".json"
+    return "fold-" + hashlib.sha256(owner.encode("utf-8")).hexdigest()[:32] + ".json"
+
+
+FOLD_RE = re.compile(r"^fold-[0-9a-f]{32}\.json$")
 
 
 def unit_tests():
@@ -70,6 +74,8 @@ def unit_tests():
         for k in [k for k, v in over.items() if v is _DROP]:
             rec.pop(k)
         os.makedirs(d, exist_ok=True)
+        if not name.startswith("fold-"):
+            name = _fname(name)
         with open(os.path.join(d, name), "w") as f:
             json.dump(rec, f)
 
@@ -83,7 +89,7 @@ def unit_tests():
     store = FoldStore(d)
     path = store.save("sid:abc:123", hashes, prefix)
     check("save returns the path written", os.path.isfile(path), path)
-    check("file name is sha256(owner)[:32].json",
+    check("file name is fold-sha256(owner)[:32].json",
           os.path.basename(path) == _fname("sid:abc:123"), os.path.basename(path))
     body = json.load(open(path, encoding="utf-8"))
     check("body version is 1", body.get("version") == 1)
@@ -141,7 +147,7 @@ def unit_tests():
     print(" bad records are skipped")
     d = os.path.join(root, "bad")
     FoldStore(d).save("good", ["g"], prefix)
-    with open(os.path.join(d, "garbage.json"), "w") as f:
+    with open(os.path.join(d, _fname("garbage")), "w") as f:
         f.write("{ not json")
     raw_record(d, "oldver.json", version=2)
     raw_record(d, "missing.json", prefix=_DROP)
@@ -154,14 +160,22 @@ def unit_tests():
     raw_record(d, "prefixnotdicts.json", prefix=["x"])
     raw_record(d, "prefixnorole.json", prefix=[{"content": "c"}])
     raw_record(d, "prefixnocontent.json", prefix=[{"role": "user"}])
+    raw_record(d, "sysrole.json", prefix=[{"role": "system", "content": "c"}])
+    raw_record(d, "toolrole.json", prefix=[{"role": "tool", "content": "c"}])
+    raw_record(d, "intcontent.json", prefix=[{"role": "user", "content": 5}])
+    raw_record(d, "nonecontent.json", prefix=[{"role": "user", "content": None}])
+    raw_record(d, "strlistcontent.json", prefix=[{"role": "user", "content": ["a"]}])
+    raw_record(d, "listcontent.json", owner="listok",
+               prefix=[{"role": "assistant", "content": [{"type": "text", "text": "t"}]}])
     try:
         got = FoldStore(d).load()
         err = ""
     except Exception as e:  # noqa: BLE001
         got, err = None, repr(e)
     check("load does not raise", got is not None, err)
-    check("only the valid fold is returned",
-          got is not None and [g["owner"] for g in got] == ["good"], repr(got)[:300])
+    check("only the valid folds are returned",
+          got is not None and sorted(g["owner"] for g in got) == ["good", "listok"],
+          repr(got)[:300])
 
     print(" max_entries")
     d = os.path.join(root, "cap")
@@ -185,6 +199,105 @@ def unit_tests():
     check("the oldest files were deleted",
           _fname("old") not in left and _fname("mid") not in left, str(left))
     check("the new save is kept", _fname("fresh") in left, str(left))
+
+    print(" only fold-named files are managed")
+    d = os.path.join(root, "unrelated")
+    os.makedirs(d)
+    others = ["settings.json", "other.json"] + [f"u{i}.json" for i in range(200)]
+    for n in others:
+        with open(os.path.join(d, n), "w") as f:
+            json.dump({"version": 1, "hash_scheme": scheme, "owner": "u",
+                       "original_hashes": ["h"], "prefix": [{"role": "user", "content": "c"}]}, f)
+    st = FoldStore(d, max_entries=2)
+    for o in ("a", "b", "c"):
+        st.save(o, ["h"], prefix)
+    check("save deletes no unrelated file",
+          all(os.path.exists(os.path.join(d, n)) for n in others),
+          str(sum(not os.path.exists(os.path.join(d, n)) for n in others)) + " missing")
+    check("load returns only fold-named records",
+          sorted(g["owner"] for g in st.load()) != [] and
+          all(g["owner"] in ("a", "b", "c") for g in st.load()), repr(st.load())[:200])
+    check("prune still caps fold files at max_entries",
+          len([n for n in os.listdir(d) if FOLD_RE.match(n)]) == 2)
+
+    print(" existing directory mode is left alone")
+    d = os.path.join(root, "preexisting")
+    os.makedirs(d)
+    os.chmod(d, 0o755)
+    FoldStore(d).save("o", ["h"], prefix)
+    check("0755 dir stays 0755", stat.S_IMODE(os.stat(d).st_mode) == 0o755,
+          oct(stat.S_IMODE(os.stat(d).st_mode)))
+
+    print(" load never raises")
+    d = os.path.join(root, "hostile")
+    FoldStore(d).save("good", ["g"], prefix)
+    target = os.path.join(root, "elsewhere.json")
+    raw_record(root, "elsewhere", owner="viasymlink")
+    os.replace(os.path.join(root, _fname("elsewhere")), target)
+    os.symlink(target, os.path.join(d, _fname("symlinked")))
+    os.mkdir(os.path.join(d, _fname("adir")))
+    with open(os.path.join(d, _fname("deep")), "w") as f:
+        f.write("[" * 100000)
+    max_bytes = getattr(fold_store, "MAX_FILE_BYTES", None)
+    check("MAX_FILE_BYTES is an int constant", isinstance(max_bytes, int), repr(max_bytes))
+    raw_record(d, "big", owner="big", prefix=[{"role": "user", "content": "x" * 5000}])
+    fold_store.MAX_FILE_BYTES = 2000
+    try:
+        got = FoldStore(d).load()
+        err = ""
+    except BaseException as e:  # noqa: BLE001
+        got, err = None, repr(e)
+    finally:
+        if max_bytes is not None:
+            fold_store.MAX_FILE_BYTES = max_bytes
+        else:
+            del fold_store.MAX_FILE_BYTES
+    check("load does not raise on hostile entries", got is not None, err)
+    check("only the regular, small, parseable fold loads",
+          got is not None and [g["owner"] for g in got] == ["good"], repr(got)[:300])
+
+    print(" empty owner")
+    for bad_owner in ("", None):
+        d = os.path.join(root, "noowner-" + repr(bad_owner))
+        try:
+            r = FoldStore(d).save(bad_owner, ["h"], prefix)
+        except Exception as e:  # noqa: BLE001
+            r = repr(e)
+        check(f"save({bad_owner!r}) returns None", r is None, repr(r))
+        check(f"save({bad_owner!r}) writes nothing",
+              not os.path.exists(d) or os.listdir(d) == [])
+
+    print(" delete")
+    d = os.path.join(root, "del")
+    st = FoldStore(d)
+    path = st.save("o", ["a", "b"], prefix)
+    check("FoldStore.delete exists", hasattr(st, "delete"))
+    r = st.delete("o", ["a"]) if hasattr(st, "delete") else None
+    check("delete with different hashes returns False", r is False, repr(r))
+    check("delete with different hashes keeps the file", os.path.exists(path))
+    r = st.delete("o", ["a", "b"]) if hasattr(st, "delete") else None
+    check("delete with matching hashes returns True", r is True, repr(r))
+    check("delete with matching hashes removes the file", not os.path.exists(path))
+    r = st.delete("o", ["a", "b"]) if hasattr(st, "delete") else None
+    check("delete of a missing file returns False", r is False, repr(r))
+
+    print(" stale tmp files")
+    d = os.path.join(root, "tmp")
+    os.makedirs(d)
+    max_age = getattr(fold_store, "TMP_MAX_AGE", None)
+    check("TMP_MAX_AGE is an int constant", isinstance(max_age, int), repr(max_age))
+    age = max_age if isinstance(max_age, int) else 3600
+    old_tmp, new_tmp, other_tmp = (os.path.join(d, n) for n in
+                                   ("fold-old.tmp", "fold-new.tmp", "other.tmp"))
+    for p_ in (old_tmp, new_tmp, other_tmp):
+        open(p_, "w").close()
+    past = time.time() - age - 100
+    os.utime(old_tmp, (past, past))
+    os.utime(other_tmp, (past, past))
+    FoldStore(d).save("o", ["h"], prefix)
+    check("save removes an old fold-*.tmp", not os.path.exists(old_tmp))
+    check("save keeps a fresh fold-*.tmp", os.path.exists(new_tmp))
+    check("save keeps an old non-fold .tmp", os.path.exists(other_tmp))
 
     print(" missing directory")
     try:
@@ -294,7 +407,7 @@ def read_chats(log):
 
 def state_files(d):
     try:
-        return [n for n in os.listdir(d) if n.endswith(".json")]
+        return [n for n in os.listdir(d) if FOLD_RE.match(n)]
     except OSError:
         return []
 
@@ -323,7 +436,7 @@ def restart_case(control):
         while time.time() < end and not state_files(state):
             time.sleep(0.3)
         check("fold saved to HOME/.claude/rolling-context", bool(state_files(state)),
-              f"no *.json in {state} after 30s")
+              f"no fold-*.json in {state} after 30s")
         stop(p1)
 
         n_before = len(read_chats(log))

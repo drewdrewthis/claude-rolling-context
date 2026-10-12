@@ -287,7 +287,7 @@ All settings via environment variables (all optional — defaults work great):
 | `ROLLING_CONTEXT_SUMMARIZER_FORMAT` | `anthropic` | `openai` = /v1/chat/completions for OpenAI-compatible endpoints |
 | `ROLLING_CONTEXT_FAILURE_COOLDOWN` | `300` | Seconds to wait before retrying after a failed compression |
 | `ROLLING_CONTEXT_FALLBACK_MODEL` | `claude-sonnet-5` | Model for the one retry when native compaction returns a 200 with no text (a refusal or a thinking-only answer on reasoning models) |
-| `ROLLING_CONTEXT_STATE_DIR` | `~/.claude/rolling-context` | Summaries are saved here so a proxy restart reuses them; files hold conversation summaries, mode 0600 |
+| `ROLLING_CONTEXT_STATE_DIR` | `~/.claude/rolling-context` | Summaries are saved here so a proxy restart reuses them; files are named `fold-*.json` (newest 128 kept) and hold conversation summaries, mode 0600 |
 | `ROLLING_CONTEXT_DISABLE` | *(unset)* | `1` = off everywhere; wins over `/rolling-context:on --global` |
 | `ROLLING_CONTEXT_HOME` | `~/.claude-rolling-context` | Where the machine-wide off flag lives |
 | `ROLLING_CONTEXT_MAX_CONCURRENT` | `4` | Background compactions allowed at once across all conversations. A conversation with no summary yet is admitted past this (up to 2x) rather than be starved |
