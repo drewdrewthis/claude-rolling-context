@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 import endpoints
 import switch
 from compressor import RollingCompressor
+from fold_store import FoldStore
 
 class FlushRotatingHandler(logging.handlers.RotatingFileHandler):
     def emit(self, record):
@@ -55,6 +56,12 @@ try:
     _BACKUPS = max(0, int(_log_setting("ROLLING_CONTEXT_LOG_BACKUPS", "3")))
 except (TypeError, ValueError):
     _BACKUPS = 3
+
+# Completed folds are saved here so a proxy restart reuses them (issue #65:
+# https://github.com/drewdrewthis/langwatch-claude-agents/issues/65).
+STATE_DIR = _log_setting("ROLLING_CONTEXT_STATE_DIR",
+                         os.path.join(os.path.expanduser("~"), ".claude", "rolling-context"))
+fold_store = FoldStore(STATE_DIR)
 
 _log_path = os.path.join(os.path.expanduser("~"), ".claude", "rolling-context-debug.log")
 # encoding is explicit: without it Windows falls back to cp1252 and the em
@@ -342,6 +349,7 @@ def _normalize_content(content):
     return content
 
 
+# Changing this hash (or _normalize_content / _strip_volatile_tags) must bump fold_store.HASH_SCHEME, or saved folds silently stop matching.
 def _hash_message(msg: dict) -> str:
     """Stable hash of a message, ignoring cache_control metadata."""
     role = msg.get("role", "")
@@ -379,14 +387,20 @@ class CompressionStore:
         with self._lock:
             best = None
             best_end = -1  # position in msg_hashes where the match ends
+            # first-hash -> start positions, so each entry only slice-compares
+            # where its chain can begin instead of at every offset.
+            starts = {}
+            for pos, h in enumerate(msg_hashes):
+                starts.setdefault(h, []).append(pos)
             for entry in self._compressions:
                 oh = entry["original_hashes"]
                 if not oh:
                     continue
-                # Search for the hash chain in msg_hashes
                 chain_len = len(oh)
                 found = False
-                for start in range(len(msg_hashes) - chain_len + 1):
+                for start in starts.get(oh[0], ()):
+                    if start + chain_len > len(msg_hashes):
+                        break
                     if msg_hashes[start:start + chain_len] == oh:
                         end = start + chain_len
                         if end > best_end:
@@ -592,6 +606,15 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
             if SUMMARY_MARKER in summarized[0]["content"]:
                 start = 2
         key_hashes = _hash_messages(summarized[start:])
+        # Persist BEFORE publishing as pending: the next request pops
+        # cache_control from these prefix dicts in place at injection, so a
+        # save after the assignment would race it (issue #65).
+        try:
+            saved = fold_store.save(entry.get("owner") or "", key_hashes, prefix)
+            if saved:
+                log.info(f"[STATE] Saved fold {os.path.basename(saved)}")
+        except Exception as e:
+            log.warning(f"[STATE] Could not save fold (compression kept in memory): {e}")
         entry["pending"] = prefix
         entry["pending_hashes"] = key_hashes
         entry["_debug_messages"] = summarized[start:]  # for mismatch debugging
@@ -935,6 +958,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     f"merged={merged_chars:,} >= current={msg_chars:,} chars, removing"
                 )
                 store.remove(match)
+                try:
+                    fold_store.delete(match.get("owner"), match["original_hashes"])
+                except Exception as e:
+                    log.warning(f"[STATE] Could not delete pruned fold: {e}")
                 match = None
 
         # Save current state for post-response compression trigger
@@ -1266,6 +1293,18 @@ def main():
     log.info(f"  Compacting via: {SUMMARIZER_BASE_URL}"
              f"{' (third-party — flattened fallback armed)' if NATIVE_FALLBACK else ''}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
+
+    try:
+        loaded = fold_store.load()
+    except Exception as e:
+        log.warning(f"[STATE] Could not load persisted folds: {e}")
+        loaded = []
+    for rec in loaded:
+        e = store.add()
+        e["owner"] = rec["owner"]
+        e["prefix"] = rec["prefix"]
+        e["original_hashes"] = rec["original_hashes"]
+    log.info(f"[STATE] Loaded {len(loaded)} persisted folds from {STATE_DIR}")
 
     server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
 
